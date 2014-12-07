@@ -9,12 +9,18 @@ gcc -lcrypt -pthread -o pdict pdict.c -Ofast -Wall
 Administrative privileges required.
 
 Run:
+
 Step 0
+
 $ ./pdict --help
+
 Step 1
+
 $ sudo ./pdict
+
 Step 2
-$ sudo ./pdict login --dict /home/lukjuz/Desktop/TZPwI/dictionary.txt
+
+$ sudo ./pdict login --dict dictionary.txt
 
 Stats for processor with 4 cores 8 threads:
-Time for n-thread:	134.73s	99999 pass	~742.255 h/s	1 reader	1-5 comparers	1 manager
+Time for n-thread:	134.73s	99999 pass	~742.255 p/s	1 reader	1-5 comparers	1 manager
