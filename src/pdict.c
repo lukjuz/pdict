@@ -1,6 +1,6 @@
 /* 
-wielowatkowe czytanie hasel z /etc/shadow
-kompilacja: gcc -lcrypt -pthread -Ofast -o pdict pdict.c
+Reading passwords from /etc/shadow and multithread hash comparison
+compilation: gcc -lcrypt -pthread -Ofast -o pdict pdict.c
 */
 #ifdef _REENTRANT
 #endif
@@ -15,46 +15,46 @@ kompilacja: gcc -lcrypt -pthread -Ofast -o pdict pdict.c
 #include <unistd.h>			/* syscall */
 #include <shadow.h> 		/* getspnam */
 #include <crypt.h>			/* crypt_r */
-#include <pwd.h>
-#include <grp.h>
+#include <pwd.h>			/* getpwuid, getpwnam */
+#include <grp.h>			/* getgrnam */
 #include <signal.h>			/* signal */
 
-#define LIM_THREADS 100
+#define LIM_THREADS 100 // upper limit of threads ( 1 reader, 99 comparers)
 
-int MAX_THREADS = 100;
-int MIN_THREADS = 2;
+int MAX_THREADS = 100;	// maximum number of threads
+int MIN_THREADS = 2;	// minimum number of threads
 
 typedef struct {
-	char *password, *hash, *line, *dict_path; // mutex_breaker, mutex_breaker, mutex_reader
-	ssize_t read; // mutex_reader
-	long pass_read_c; // licznik hasel odczytanych przez reader'a. mutex_reader
-	long pass_proced_c; // licznik danych przetworzonych przez comparery. mutex_breaker
-	long num_threads; // mutex_manager
-	int verbose;	
+	char *password, *hash, *line, *dict_path; // protected by pass_lock, mtx_reader
+	ssize_t read; 		// number of char's read by reader - protected by mtx_reader
+	long pass_read_c; 	// counter of password read by reader - protected by mtx_reader
+	long pass_proced_c; // counter of password proceed by comparer - protected by mtx_comparer
+	long num_threads;	// number of active threads - protected by mtx_manager
+	int verbose;		// verbose mode - protected by settings_lock
 } SHARED_DATA;
 
 struct thread_data {
-	long  thread_id;
-	char *spassword;
-	int verbose;
+	long  thread_id;	// thread ID
+	char *spassword;	// comparer's local copy of password's hash he is looking for 
+	int verbose;		// TODO settings_lock in manager
 };
 
 SHARED_DATA shared_data;
-pthread_mutex_t  mutex_reader;
-pthread_mutex_t  mutex_breaker;
-pthread_mutex_t  mutex_breaker_hold;
-pthread_mutex_t  mutex_manager;
-pthread_cond_t 	 read_pass;
-pthread_cond_t   proc_pass; // TODO optymalizacja pod wzgledem ilosci warunkow
-pthread_cond_t   hold_breaker;
-pthread_cond_t   changed_num_threads;
-pthread_cond_t   done;
-pthread_rwlock_t pass_lock;
-pthread_rwlock_t c_proc_lock; // rwlock dla pass_proced_c
-pthread_rwlock_t c_read_lock;
-pthread_rwlock_t settings_lock; // verbose, min_max_threads
+pthread_mutex_t  mtx_reader;		// mutex to signal need of another word to compare
+pthread_mutex_t  mtx_comparer;		// mutex to signal accomplishment of password searching
+pthread_mutex_t  mtx_comparer_hold; // mutex to signal need of change comparer's state
+pthread_mutex_t  mtx_manager;		// mutex to block manager until change of comparer's state
+pthread_cond_t 	 cnd_r_pass;		// condition to indicate need of next word to compare
+pthread_cond_t   cnd_p_pass;		// condition to indicate readness of another word to compare
+pthread_cond_t   hold_breaker;		// condition to block comparers
+pthread_cond_t   changed_num_threads;// condition to block thread until accomplishment of comparer state changes
+pthread_cond_t   done;				// condition to block thread until accomplishment of password searching
+pthread_rwlock_t pass_lock;			// lock for shared:password
+pthread_rwlock_t c_proc_lock;		// lock for shared:pass_proced_c
+pthread_rwlock_t c_read_lock;		// lock for shared:pass_read_c
+pthread_rwlock_t settings_lock; 	// lock for shared:verbose, shared:min_max_threads
 
-int timespec_subtract(x, y, result)
+int timespec_subtract(x, y, result) // time subtract
 	struct timespec *result, *x, *y;
 	{
 	if (x->tv_nsec < y->tv_nsec) { /* Perform the carry for the later subtraction by updating y. */
@@ -72,40 +72,41 @@ int timespec_subtract(x, y, result)
 	return x->tv_sec < y->tv_sec; /* Return 1 if result is negative. */
 }
 
-void *password_comparer(void *thread_arg) {
+void *password_comparer(void *thread_arg) { // hash generator and comparer
 	struct thread_data *t_data;
 	struct crypt_data *c_data = malloc(sizeof(struct crypt_data));
 	c_data->initialized = 0;
 	int comp_len, i;
 	ssize_t read = 0;
 	char *password, *result;
+	pid_t tid = syscall(SYS_gettid);
 	t_data = (struct thread_data *) thread_arg;
-   	if (t_data->verbose > 1) printf("Comparer#%ld(%ld): starting!\n", t_data->thread_id, syscall(SYS_gettid));
-	pthread_mutex_lock(&mutex_manager);
+   	if (t_data->verbose > 1) printf("Comparer#%ld(%d): starting!\n", t_data->thread_id, tid);
+	pthread_mutex_lock(&mtx_manager);
 	pthread_cond_signal(&changed_num_threads);
-	pthread_mutex_unlock(&mutex_manager);
+	pthread_mutex_unlock(&mtx_manager);
 	pthread_rwlock_rdlock(&pass_lock);
 	while (shared_data.password == NULL) {
 		pthread_rwlock_unlock(&pass_lock);
-		pthread_mutex_lock(&mutex_reader);
+		pthread_mutex_lock(&mtx_reader);
 		while (shared_data.line == NULL) {
-			pthread_cond_signal(&read_pass);
-			pthread_cond_wait(&proc_pass, &mutex_reader);
+			pthread_cond_signal(&cnd_r_pass);
+			pthread_cond_wait(&cnd_p_pass, &mtx_reader);
 			pthread_rwlock_rdlock(&pass_lock);
 			if (shared_data.password != NULL) {
-				pthread_mutex_unlock(&mutex_reader);	
+				pthread_mutex_unlock(&mtx_reader);	
 				goto exit; // double loop exit
 			}
 			pthread_rwlock_unlock(&pass_lock);
 		}
-		pthread_mutex_lock(&mutex_manager);
+		pthread_mutex_lock(&mtx_manager);
 		if (shared_data.num_threads > t_data->thread_id) {
-			pthread_mutex_unlock(&mutex_manager);
+			pthread_mutex_unlock(&mtx_manager);
 			password = shared_data.line;
 			read = shared_data.read;
 			shared_data.line = NULL;
-			pthread_cond_signal(&read_pass);
-			pthread_mutex_unlock(&mutex_reader);	
+			pthread_cond_signal(&cnd_r_pass);
+			pthread_mutex_unlock(&mtx_reader);	
 			password[read - 1] = '\0';
 			if (t_data->verbose > 2) printf("Comparer#%ld: %s\n", t_data->thread_id, password);
 			result = crypt_r(password, t_data->spassword, c_data); /* malloc(sizeof(char)); */
@@ -120,41 +121,40 @@ void *password_comparer(void *thread_arg) {
 				for (i = 0; i < comp_len+1; i++)
 					shared_data.hash[i] = result[i];
 				pthread_rwlock_unlock(&pass_lock);
-				pthread_mutex_lock(&mutex_breaker);
+				pthread_mutex_lock(&mtx_comparer);
 				pthread_cond_broadcast(&done);
-				pthread_mutex_unlock(&mutex_breaker);	
+				pthread_mutex_unlock(&mtx_comparer);	
 			} else free(password);
 			pthread_rwlock_wrlock(&c_proc_lock);
 			shared_data.pass_proced_c++;
 			pthread_rwlock_unlock(&c_proc_lock);
 		} else {
-			pthread_mutex_unlock(&mutex_reader);
-			if (t_data->verbose > 1) printf("Comparer#%ld: holding!\n", t_data->thread_id);
+			pthread_mutex_unlock(&mtx_reader);
+			if (t_data->verbose > 1) printf("Comparer#%ld(%d): holding!\n", t_data->thread_id, tid);
+			pthread_cond_signal(&changed_num_threads);		
+			pthread_mutex_unlock(&mtx_manager);
+			pthread_mutex_lock(&mtx_comparer_hold);
+			pthread_cond_wait(&hold_breaker, &mtx_comparer_hold);
+			pthread_mutex_unlock(&mtx_comparer_hold);
+			pthread_mutex_lock(&mtx_manager);	
+			t_data->thread_id = shared_data.num_threads - 1; // przyjmij nowe ID
+			if (t_data->verbose > 1) printf("Comparer#%ld(%d): waking up!\n", t_data->thread_id, tid);
 			pthread_cond_signal(&changed_num_threads);
-			pthread_mutex_unlock(&mutex_manager);
-			pthread_mutex_lock(&mutex_breaker_hold);
-			pthread_cond_wait(&hold_breaker, &mutex_breaker_hold);
-			pthread_mutex_unlock(&mutex_breaker_hold);
-			pthread_mutex_lock(&mutex_manager);	
-			if (shared_data.num_threads - 1 != t_data->thread_id && shared_data.num_threads != 0)
-				t_data->thread_id = shared_data.num_threads - 1; // przyjmij nowe ID
-			if (t_data->verbose > 1) printf("Comparer#%ld: waking up!\n", t_data->thread_id);
-			pthread_cond_signal(&changed_num_threads);
-			pthread_mutex_unlock(&mutex_manager);		
+			pthread_mutex_unlock(&mtx_manager);		
 		}
 		pthread_rwlock_rdlock(&pass_lock);
 	}	
 	exit:
 	pthread_rwlock_unlock(&pass_lock);
-	pthread_mutex_lock(&mutex_manager);
+	pthread_mutex_lock(&mtx_manager);
 	pthread_cond_signal(&changed_num_threads);
-	pthread_mutex_unlock(&mutex_manager);	
-	if (t_data->verbose > 1) printf("Comparer#%ld: exiting!\n", t_data->thread_id); // ID moga sie powtarzac! co jest mylace!
+	pthread_mutex_unlock(&mtx_manager);	
+	if (t_data->verbose > 1) printf("Comparer#%ld(%d): exiting!\n", t_data->thread_id, tid); // num moga sie powtarzac! co jest mylace!
 	free(c_data);  	
 	pthread_exit(NULL);
 }
 
-void *dictionary_reader(void *thread_arg) {
+void *dictionary_reader(void *thread_arg) { // password reader from dictionry
 	FILE *fp;
 	char *line = NULL;
 	size_t len = 0;
@@ -179,13 +179,13 @@ void *dictionary_reader(void *thread_arg) {
 		pthread_rwlock_wrlock(&c_read_lock);
 		shared_data.pass_read_c++;
 		pthread_rwlock_unlock(&c_read_lock);
-		pthread_mutex_lock(&mutex_reader);
+		pthread_mutex_lock(&mtx_reader);
 		while (shared_data.line != NULL) {
-			pthread_cond_signal(&proc_pass);		
-			pthread_cond_wait(&read_pass, &mutex_reader);
+			pthread_cond_signal(&cnd_p_pass);		
+			pthread_cond_wait(&cnd_r_pass, &mtx_reader);
 			pthread_rwlock_rdlock(&pass_lock);
 			if (shared_data.password != NULL) {
-				pthread_mutex_unlock(&mutex_reader);	
+				pthread_mutex_unlock(&mtx_reader);	
 				goto exit;
 			}
 			pthread_rwlock_unlock(&pass_lock);		
@@ -193,8 +193,8 @@ void *dictionary_reader(void *thread_arg) {
 		shared_data.line = line;
 		shared_data.read = read;
 		line = NULL;
-		pthread_cond_signal(&proc_pass);	//WTF
-		pthread_mutex_unlock(&mutex_reader);
+		pthread_cond_signal(&cnd_p_pass);	//WTF
+		pthread_mutex_unlock(&mtx_reader);
 		len = 0;
 		read = getline(&line, &len, fp);
 		pthread_rwlock_rdlock(&pass_lock);
@@ -209,10 +209,10 @@ void *dictionary_reader(void *thread_arg) {
 		pthread_rwlock_unlock(&pass_lock);
 		clock_gettime(CLOCK_REALTIME, &ts);
 		ts.tv_sec += 1;
-		pthread_mutex_lock(&mutex_reader);
-		pthread_cond_broadcast(&proc_pass);
-		pthread_cond_timedwait(&read_pass, &mutex_reader, &ts);
-		pthread_mutex_unlock(&mutex_reader);
+		pthread_mutex_lock(&mtx_reader);
+		pthread_cond_broadcast(&cnd_p_pass);
+		pthread_cond_timedwait(&cnd_r_pass, &mtx_reader, &ts);
+		pthread_mutex_unlock(&mtx_reader);
 		pthread_rwlock_rdlock(&pass_lock);
 		pthread_rwlock_rdlock(&c_proc_lock);
 		pthread_rwlock_rdlock(&c_read_lock);
@@ -227,14 +227,14 @@ void *dictionary_reader(void *thread_arg) {
 		shared_data.password = "";
 		pthread_rwlock_unlock(&pass_lock);
 	}
-	pthread_mutex_lock(&mutex_breaker);
+	pthread_mutex_lock(&mtx_comparer);
 	pthread_cond_broadcast(&done);
-	pthread_mutex_unlock(&mutex_breaker);
+	pthread_mutex_unlock(&mtx_comparer);
 	if (t_data->verbose > 1) printf("Reader: exiting!\n");	
 	pthread_exit(NULL);
 }
 
-void *thread_manager(void *t_data) {
+void *thread_manager(void *t_data) { // workers number thread manager
 	int rc, change_flag = 1, decision_flag; //change_flag trzyma informacje czy dodano, czy odjeto watek
 	long t, comparers_created, old_pass_counter_value;
 	double ratio = 1, pass_per_sec = 1, new_pass_per_sec;
@@ -246,11 +246,11 @@ void *thread_manager(void *t_data) {
 	pthread_attr_t attr;
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-	pthread_mutex_init(&mutex_reader, NULL);	
-	pthread_mutex_init(&mutex_breaker_hold, NULL);	
-	pthread_mutex_init(&mutex_manager, NULL);
-	pthread_cond_init(&read_pass, NULL);
-	pthread_cond_init(&proc_pass, NULL);
+	pthread_mutex_init(&mtx_reader, NULL);	
+	pthread_mutex_init(&mtx_comparer_hold, NULL);	
+	pthread_mutex_init(&mtx_manager, NULL);
+	pthread_cond_init(&cnd_r_pass, NULL);
+	pthread_cond_init(&cnd_p_pass, NULL);
 	pthread_cond_init(&hold_breaker, NULL);
 	pthread_cond_init(&changed_num_threads, NULL);
 	pthread_rwlock_init(&pass_lock, NULL);
@@ -276,40 +276,38 @@ void *thread_manager(void *t_data) {
 				thread_data_array[t].thread_id = t;
 				thread_data_array[t].spassword = m_data->spassword;
 				thread_data_array[t].verbose = m_data->verbose;
-				pthread_mutex_lock(&mutex_manager);
+				pthread_mutex_lock(&mtx_manager);
 				rc = pthread_create(&call_thread[t], &attr, password_comparer, (void *) &thread_data_array[t]);
 				if (rc != 0)
 					printf("Manager: ERROR; return code from pthread_create() is %d\n", rc);
 				else {
 					t++;
 					shared_data.num_threads = t;
-					pthread_cond_wait(&changed_num_threads, &mutex_manager);
+					pthread_cond_wait(&changed_num_threads, &mtx_manager);
 					comparers_created++;
 				}
-				pthread_mutex_unlock(&mutex_manager);
+				pthread_mutex_unlock(&mtx_manager);
 			} else { //budzenie watkow			
 				if (m_data->verbose > 1) printf("Manager: waking up Comparer#%ld\n", t);
 				t++;
-				pthread_mutex_lock(&mutex_breaker_hold);
-				pthread_mutex_lock(&mutex_manager);
+				pthread_mutex_lock(&mtx_comparer_hold);
+				pthread_mutex_lock(&mtx_manager);
 				shared_data.num_threads = t;
 				pthread_cond_signal(&hold_breaker);
-				pthread_mutex_unlock(&mutex_breaker_hold);
-				pthread_cond_wait(&changed_num_threads, &mutex_manager);
-				pthread_mutex_unlock(&mutex_manager);
+				pthread_mutex_unlock(&mtx_comparer_hold);
+				pthread_cond_wait(&changed_num_threads, &mtx_manager);
+				pthread_mutex_unlock(&mtx_manager);
 			}				
-			pass_per_sec = new_pass_per_sec;
 			decision_flag = 0;
 			change_flag = 1;
 		}
 		while (t > MAX_THREADS) {
 			t--;	
 			if (m_data->verbose > 1) printf("Manager: stopping comparer thread %ld\n", t);										
-			pthread_mutex_lock(&mutex_manager);
+			pthread_mutex_lock(&mtx_manager);
 			shared_data.num_threads = t;
-			pthread_cond_wait(&changed_num_threads, &mutex_manager);
-			pthread_mutex_unlock(&mutex_manager);
-			pass_per_sec = new_pass_per_sec;
+			pthread_cond_wait(&changed_num_threads, &mtx_manager);
+			pthread_mutex_unlock(&mtx_manager);
 			decision_flag = change_flag = 0;
 		}	
 		if (ratio > 1.05) { 
@@ -319,50 +317,47 @@ void *thread_manager(void *t_data) {
 					thread_data_array[t].thread_id = t;
 					thread_data_array[t].spassword = m_data->spassword;
 					thread_data_array[t].verbose = m_data->verbose;
-					pthread_mutex_lock(&mutex_manager);
+					pthread_mutex_lock(&mtx_manager);
 					rc = pthread_create(&call_thread[t], &attr, password_comparer, (void *) &thread_data_array[t]);
 					if (rc != 0)
 						printf("Manager: ERROR; return code from pthread_create() is %d\n", rc);
 					else {
 						t++;
 						shared_data.num_threads = t;
-						pthread_cond_wait(&changed_num_threads, &mutex_manager);
+						pthread_cond_wait(&changed_num_threads, &mtx_manager);
 						comparers_created++;
 					}
-					pthread_mutex_unlock(&mutex_manager);
+					pthread_mutex_unlock(&mtx_manager);
 				} else { //budzenie watkow			
 					if (m_data->verbose > 1) printf("Manager: waking up Comparer#%ld\n", t);
 					t++;
-					pthread_mutex_lock(&mutex_breaker_hold);
-					pthread_mutex_lock(&mutex_manager);
+					pthread_mutex_lock(&mtx_comparer_hold);
+					pthread_mutex_lock(&mtx_manager);
 					shared_data.num_threads = t;
 					pthread_cond_signal(&hold_breaker);
-					pthread_mutex_unlock(&mutex_breaker_hold);
-					pthread_cond_wait(&changed_num_threads, &mutex_manager);
-					pthread_mutex_unlock(&mutex_manager);
+					pthread_mutex_unlock(&mtx_comparer_hold);
+					pthread_cond_wait(&changed_num_threads, &mtx_manager);
+					pthread_mutex_unlock(&mtx_manager);
 				}				
-				pass_per_sec = new_pass_per_sec;
 				decision_flag = 0;
 				change_flag = 1;
 			} else if (change_flag == 0 && t > MIN_THREADS) {
 				t--;	
 				if (m_data->verbose > 1) printf("Manager: stopping comparer thread %ld\n", t);										
-				pthread_mutex_lock(&mutex_manager);
+				pthread_mutex_lock(&mtx_manager);
 				shared_data.num_threads = t;
-				pthread_cond_wait(&changed_num_threads, &mutex_manager);
-				pthread_mutex_unlock(&mutex_manager);
-				pass_per_sec = new_pass_per_sec;
+				pthread_cond_wait(&changed_num_threads, &mtx_manager);
+				pthread_mutex_unlock(&mtx_manager);
 				decision_flag = change_flag = 0;
 			} else change_flag = !change_flag; // brzegowy, aby nie utknac na 1 lub max watkow
 		} else if (ratio < 0.95) {
 			if (change_flag == 1 && t > MIN_THREADS) {			
 				t--;
 				if (m_data->verbose > 1) printf("Manager: stopping comparer thread %ld\n", t);			
-				pthread_mutex_lock(&mutex_manager);
+				pthread_mutex_lock(&mtx_manager);
 				shared_data.num_threads = t;
-				pthread_cond_wait(&changed_num_threads, &mutex_manager);
-				pthread_mutex_unlock(&mutex_manager);
-				pass_per_sec = new_pass_per_sec;
+				pthread_cond_wait(&changed_num_threads, &mtx_manager);
+				pthread_mutex_unlock(&mtx_manager);
 				decision_flag = change_flag = 0;
 			} else if (change_flag == 0 && t < MAX_THREADS) {
 				if (comparers_created < t) {
@@ -370,29 +365,28 @@ void *thread_manager(void *t_data) {
 					thread_data_array[t].thread_id = t;
 					thread_data_array[t].spassword = m_data->spassword;
 					thread_data_array[t].verbose = m_data->verbose;
-					pthread_mutex_lock(&mutex_manager);
+					pthread_mutex_lock(&mtx_manager);
 					rc = pthread_create(&call_thread[t], &attr, password_comparer, (void *) &thread_data_array[t]);
 					if (rc != 0)
 						printf("Manager: ERROR; return code from pthread_create() is %d\n", rc);
 					else {
 						t++;
 						shared_data.num_threads = t;
-						pthread_cond_wait(&changed_num_threads, &mutex_manager);
+						pthread_cond_wait(&changed_num_threads, &mtx_manager);
 						comparers_created++;
 					}
-					pthread_mutex_unlock(&mutex_manager);
+					pthread_mutex_unlock(&mtx_manager);
 				} else { //budzenie watkow			
 					if (m_data->verbose > 1) printf("Manager: waking up Comparer#%ld\n", t);
 					t++;
-					pthread_mutex_lock(&mutex_breaker_hold);
-					pthread_mutex_lock(&mutex_manager);
+					pthread_mutex_lock(&mtx_comparer_hold);
+					pthread_mutex_lock(&mtx_manager);
 					shared_data.num_threads = t;
 					pthread_cond_signal(&hold_breaker);
-					pthread_mutex_unlock(&mutex_breaker_hold);
-					pthread_cond_wait(&changed_num_threads, &mutex_manager);
-					pthread_mutex_unlock(&mutex_manager);
+					pthread_mutex_unlock(&mtx_comparer_hold);
+					pthread_cond_wait(&changed_num_threads, &mtx_manager);
+					pthread_mutex_unlock(&mtx_manager);
 				}				
-				pass_per_sec = new_pass_per_sec;
 				decision_flag = 0;
 				change_flag = 1;
 			} else change_flag = !change_flag; // brzegowy, aby nie utknac na 1 lub max watkow
@@ -405,50 +399,47 @@ void *thread_manager(void *t_data) {
 						thread_data_array[t].thread_id = t;
 						thread_data_array[t].spassword = m_data->spassword;
 						thread_data_array[t].verbose = m_data->verbose;
-						pthread_mutex_lock(&mutex_manager);
+						pthread_mutex_lock(&mtx_manager);
 						rc = pthread_create(&call_thread[t], &attr, password_comparer, (void *) &thread_data_array[t]);
 						if (rc != 0)
 							printf("Manager: ERROR; return code from pthread_create() is %d\n", rc);
 						else {
 							t++;
 							shared_data.num_threads = t;
-							pthread_cond_wait(&changed_num_threads, &mutex_manager);
+							pthread_cond_wait(&changed_num_threads, &mtx_manager);
 							comparers_created++;
 						}
-						pthread_mutex_unlock(&mutex_manager);
+						pthread_mutex_unlock(&mtx_manager);
 					} else { //budzenie watkow			
 						if (m_data->verbose > 1) printf("Manager: waking up Comparer#%ld\n", t);
 						t++;
-						pthread_mutex_lock(&mutex_breaker_hold);
-						pthread_mutex_lock(&mutex_manager);
+						pthread_mutex_lock(&mtx_comparer_hold);
+						pthread_mutex_lock(&mtx_manager);
 						shared_data.num_threads = t;
 						pthread_cond_signal(&hold_breaker);
-						pthread_mutex_unlock(&mutex_breaker_hold);
-						pthread_cond_wait(&changed_num_threads, &mutex_manager);
-						pthread_mutex_unlock(&mutex_manager);
+						pthread_mutex_unlock(&mtx_comparer_hold);
+						pthread_cond_wait(&changed_num_threads, &mtx_manager);
+						pthread_mutex_unlock(&mtx_manager);
 					}				
-					pass_per_sec = new_pass_per_sec;
 					decision_flag = 0;
 					change_flag = 1;				
 				} else if (change_flag == 0 && t > MIN_THREADS) {					
 					t--;
 					if (m_data->verbose > 1) printf("Manager: stopping comparer thread %ld\n", t);			
-					pthread_mutex_lock(&mutex_manager);
+					pthread_mutex_lock(&mtx_manager);
 					shared_data.num_threads = t;
-					pthread_cond_wait(&changed_num_threads, &mutex_manager);
-					pthread_mutex_unlock(&mutex_manager);
-					pass_per_sec = new_pass_per_sec;
+					pthread_cond_wait(&changed_num_threads, &mtx_manager);
+					pthread_mutex_unlock(&mtx_manager);
 					decision_flag = change_flag = 0;
 				} else change_flag = !change_flag; // brzegowy, aby nie utknac na 1 lub max watkow		
 			} else if (decision_flag < -10) {
 				if (change_flag == 1 && t > MIN_THREADS) {
 					t--;					
 					if (m_data->verbose > 1) printf("Manager: stopping comparer thread %ld\n", t);						
-					pthread_mutex_lock(&mutex_manager);
+					pthread_mutex_lock(&mtx_manager);
 					shared_data.num_threads = t;
-					pthread_cond_wait(&changed_num_threads, &mutex_manager);
-					pthread_mutex_unlock(&mutex_manager);
-					pass_per_sec = new_pass_per_sec;
+					pthread_cond_wait(&changed_num_threads, &mtx_manager);
+					pthread_mutex_unlock(&mtx_manager);
 					decision_flag = change_flag = 0;
 				} else if (change_flag == 0 && t < MAX_THREADS) {
 					if (comparers_created < t) {
@@ -456,29 +447,28 @@ void *thread_manager(void *t_data) {
 						thread_data_array[t].thread_id = t;
 						thread_data_array[t].spassword = m_data->spassword;
 						thread_data_array[t].verbose = m_data->verbose;
-						pthread_mutex_lock(&mutex_manager);
+						pthread_mutex_lock(&mtx_manager);
 						rc = pthread_create(&call_thread[t], &attr, password_comparer, (void *) &thread_data_array[t]);
 						if (rc != 0)
 							printf("Manager: ERROR; return code from pthread_create() is %d\n", rc);
 						else {
 							t++;
 							shared_data.num_threads = t;
-							pthread_cond_wait(&changed_num_threads, &mutex_manager);
+							pthread_cond_wait(&changed_num_threads, &mtx_manager);
 							comparers_created++;
 						}
-						pthread_mutex_unlock(&mutex_manager);
+						pthread_mutex_unlock(&mtx_manager);
 					} else { //budzenie watkow			
 						if (m_data->verbose > 1) printf("Manager: waking up Comparer#%ld\n", t);
 						t++;
-						pthread_mutex_lock(&mutex_manager);
-						pthread_mutex_lock(&mutex_breaker_hold);						
+						pthread_mutex_lock(&mtx_manager);
+						pthread_mutex_lock(&mtx_comparer_hold);						
 						shared_data.num_threads = t;
 						pthread_cond_signal(&hold_breaker);
-						pthread_mutex_unlock(&mutex_breaker_hold);
-						pthread_cond_wait(&changed_num_threads, &mutex_manager);
-						pthread_mutex_unlock(&mutex_manager);
+						pthread_mutex_unlock(&mtx_comparer_hold);
+						pthread_cond_wait(&changed_num_threads, &mtx_manager);
+						pthread_mutex_unlock(&mtx_manager);
 					}				
-					pass_per_sec = new_pass_per_sec;
 					decision_flag = 0;
 					change_flag = 1;
 				} else change_flag = !change_flag; // brzegowy, aby nie utknac na 1 lub max watkow		
@@ -488,9 +478,9 @@ void *thread_manager(void *t_data) {
 		clock_gettime(CLOCK_REALTIME, &tsold);
 		tsnew.tv_sec = tsold.tv_sec + 1;
 		tsnew.tv_nsec = tsold.tv_nsec;
-		pthread_mutex_lock(&mutex_breaker);
-		pthread_cond_timedwait(&done, &mutex_breaker, &tsnew);
-		pthread_mutex_unlock(&mutex_breaker);
+		pthread_mutex_lock(&mtx_comparer);
+		pthread_cond_timedwait(&done, &mtx_comparer, &tsnew);
+		pthread_mutex_unlock(&mtx_comparer);
 		clock_gettime(CLOCK_REALTIME, &tsnew);
 		timespec_subtract(&tsnew, &tsold, &tsres);
 		tsold = tsnew;
@@ -504,7 +494,7 @@ void *thread_manager(void *t_data) {
 		if ( shared_data.verbose != m_data->verbose ) {
 			m_data->verbose = shared_data.verbose;
 			int i = 0;
-			for ( i = 0; i < MAX_THREADS && call_thread[i] != 0; i++)
+			for ( i = 0; i < LIM_THREADS && call_thread[i] != 0; i++)
 				thread_data_array[i].verbose = m_data->verbose;
 		}
 		pthread_rwlock_unlock(&settings_lock);
@@ -517,14 +507,14 @@ void *thread_manager(void *t_data) {
 		}
 		pthread_rwlock_rdlock(&pass_lock);
 	}
-	pthread_mutex_lock(&mutex_breaker_hold);	
+	pthread_mutex_lock(&mtx_comparer_hold);	
 	pthread_cond_broadcast(&hold_breaker);
-	pthread_mutex_unlock(&mutex_breaker_hold);
+	pthread_mutex_unlock(&mtx_comparer_hold);
 	pthread_rwlock_unlock(&pass_lock);
-	pthread_mutex_lock(&mutex_reader);
-	pthread_cond_signal(&read_pass); // odblokowanie readera, aby mogl zakonczyc dzialanie
-	pthread_cond_broadcast(&proc_pass);
-	pthread_mutex_unlock(&mutex_reader);
+	pthread_mutex_lock(&mtx_reader);
+	pthread_cond_signal(&cnd_r_pass); // odblokowanie readera, aby mogl zakonczyc dzialanie
+	pthread_cond_broadcast(&cnd_p_pass);
+	pthread_mutex_unlock(&mtx_reader);
 	void *res;	
 	for (t = 0; t < LIM_THREADS; t++)
 		if (call_thread[t] != 0)
@@ -538,7 +528,7 @@ void *thread_manager(void *t_data) {
 	pthread_exit(NULL);
 }
 
-int strncmp(const char *s1, const char *s2, size_t n) {
+int strncmp(const char *s1, const char *s2, size_t n) { // compare two strings of known length
 	if (!n) return 0;
 	while (--n && *s1 && *s1 == *s2) {
 		s1++;
@@ -547,20 +537,20 @@ int strncmp(const char *s1, const char *s2, size_t n) {
 	return *(unsigned char *) s1 - *(unsigned char *) s2;
 }
 
-void int_handler(int signum) {
+void int_handler(int signum) { // SIGINT handler - graceful exit
 	pthread_rwlock_wrlock(&pass_lock);
 	shared_data.password = ""; // zatrzymanie watkow
 	pthread_rwlock_unlock(&pass_lock);
-	pthread_mutex_lock(&mutex_reader);
-	pthread_cond_signal(&read_pass); // wyslij info do readera
-	pthread_cond_broadcast(&proc_pass); // wyslij info do wszystkich comparerow	
-	pthread_mutex_unlock (&mutex_reader);
-	pthread_mutex_lock(&mutex_breaker_hold);
+	pthread_mutex_lock(&mtx_reader);
+	pthread_cond_signal(&cnd_r_pass); // wyslij info do readera
+	pthread_cond_broadcast(&cnd_p_pass); // wyslij info do wszystkich comparerow	
+	pthread_mutex_unlock (&mtx_reader);
+	pthread_mutex_lock(&mtx_comparer_hold);
 	pthread_cond_broadcast(&hold_breaker); // obudz wszystkie comparery
-	pthread_mutex_unlock(&mutex_breaker_hold);
+	pthread_mutex_unlock(&mtx_comparer_hold);
 }
 
-void tstp_handler(int signum) { // make it thread safe
+void tstp_handler(int signum) { // SIGTSTP handler - showing context menu
 	int input;
 	int i = 0, opt = 0, saved_verb, num;
 	pthread_rwlock_wrlock(&settings_lock);	
@@ -641,11 +631,12 @@ void print_usage(char* name) {
 	printf("\n Usage:\n");
 	printf("  %s <user><--dict PATH><login>[options]\n\n", name);
 	printf("   --dict <PATH_TO_DICTIONARY> \tpass location of dictionary\n");
-	printf("   -mint \t\tminimum number of threads\n");
-	printf("   -maxt \t\tmaximum number of threads\n");
+	printf("   -mint \t\t\tminimum number of threads\n");
+	printf("   -maxt \t\t\tmaximum number of threads\n");
 	printf("   -v \t\t\t\tverbose - print progress info\n");
 	printf("   -fv \t\t\t\tfull verbose - print progress info,\n\t\t\t\tthread's state changes\n");
 	printf("   -debug \t\t\tdebug - print progress info, thread's info\n\n");
+	printf(" Example:\n %s --dict /home/admin/dictionary.txt -v -mint 4 -maxt 5 userlogin\n\n", name);
 }
 
 int main(int argc, char *argv[]) {
@@ -749,7 +740,7 @@ int main(int argc, char *argv[]) {
 	signal(SIGTSTP, tstp_handler);
 	pthread_attr_init(&attr);
 	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-	pthread_mutex_init(&mutex_breaker, NULL);
+	pthread_mutex_init(&mtx_comparer, NULL);
 	pthread_cond_init (&done, NULL);	
 	struct timeval start, stop, res;
 	gettimeofday(&start, NULL);
@@ -763,9 +754,9 @@ int main(int argc, char *argv[]) {
 		printf("ERROR; return code from pthread_create() is %d\n", rc);
 		return -1;
 	}
-	pthread_mutex_lock(&mutex_breaker);
-	pthread_cond_wait(&done, &mutex_breaker); /* Wait on the other threads */
-	pthread_mutex_unlock(&mutex_breaker);
+	pthread_mutex_lock(&mtx_comparer);
+	pthread_cond_wait(&done, &mtx_comparer); /* Wait on the other threads */
+	pthread_mutex_unlock(&mtx_comparer);
 	gettimeofday(&stop, NULL);
 	printf("\nLogin:\t\t%s\n",  slogin);
 	pthread_rwlock_rdlock(&pass_lock);
@@ -790,13 +781,13 @@ int main(int argc, char *argv[]) {
 	pthread_attr_destroy(&attr);
 	free(m_data);
 	free(shared_data.hash);
-	pthread_mutex_destroy(&mutex_reader);
-	pthread_mutex_destroy(&mutex_breaker);
-	pthread_mutex_destroy(&mutex_breaker_hold);
-	pthread_mutex_destroy(&mutex_manager);
+	pthread_mutex_destroy(&mtx_reader);
+	pthread_mutex_destroy(&mtx_comparer);
+	pthread_mutex_destroy(&mtx_comparer_hold);
+	pthread_mutex_destroy(&mtx_manager);
 	pthread_cond_destroy(&done);
-	pthread_cond_destroy(&read_pass);
-	pthread_cond_destroy(&proc_pass);
+	pthread_cond_destroy(&cnd_r_pass);
+	pthread_cond_destroy(&cnd_p_pass);
 	pthread_cond_destroy(&changed_num_threads);
 	pthread_cond_destroy(&hold_breaker);
 	pthread_rwlock_destroy(&pass_lock);
