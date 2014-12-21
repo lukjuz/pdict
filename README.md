@@ -4,7 +4,11 @@ pdict
 Multi-thread dictionary Shadow password breaker for Linux administrators
 
 Compile:
-gcc -lcrypt -pthread -o pdict pdict.c -Ofast -Wall
+gcc -lcrypt -pthread -c thread_data.c -Ofast -Wall
+gcc -lcrypt -pthread -c manager.c -Ofast -Wall
+gcc -lcrypt -pthread -c reader.c -Ofast -Wall
+gcc -lcrypt -pthread -c comparer.c -Ofast -Wall
+gcc -lcrypt -pthread -o pdict pdict.c thread_data.o manager.o reader.o comparer.o -Ofast -Wall
 
 Administrative privileges required.
 
