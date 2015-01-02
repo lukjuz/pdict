@@ -33,3 +33,4 @@ $ sudo ./pdict login --dict dictionary.txt
 
 Stats for processor with 4 cores 8 threads:
 Time for n-thread:	134.73s	99999 pass	~742.255 p/s	1 reader	1-5 comparers	1 manager
+			130.96s 99999 hasel	~763.59 p/s	1 reader	1-6 comparer	1 manager (RC8)
